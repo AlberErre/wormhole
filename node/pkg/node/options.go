@@ -17,7 +17,6 @@ import (
 	"github.com/certusone/wormhole/node/pkg/processor"
 	gossipv1 "github.com/certusone/wormhole/node/pkg/proto/gossip/v1"
 	"github.com/certusone/wormhole/node/pkg/readiness"
-	"github.com/certusone/wormhole/node/pkg/reporter"
 	"github.com/certusone/wormhole/node/pkg/supervisor"
 	"github.com/certusone/wormhole/node/pkg/watchers"
 	"github.com/certusone/wormhole/node/pkg/watchers/ibc"
@@ -286,6 +285,14 @@ func GuardianOptionWatchers(watcherConfigs []watchers.WatcherConfig, ibcWatcherC
 									zap.Stringer("msgChainId", msg.EmitterChain),
 									zap.Stringer("watcherChainId", chainId),
 								)
+							} else if msg.EmitterAddress == vaa.GovernanceEmitter && msg.EmitterChain == vaa.GovernanceChain {
+								logger.Error(
+									"EMERGENCY: PLEASE REPORT THIS IMMEDIATELY! A Solana message was emitted from the governance emitter. This should never be possible.",
+									zap.Stringer("emitter_chain", msg.EmitterChain),
+									zap.Stringer("emitter_address", msg.EmitterAddress),
+									zap.Uint32("nonce", msg.Nonce),
+									zap.Stringer("txhash", msg.TxHash),
+									zap.Time("timestamp", msg.Timestamp))
 							} else {
 								g.msgC.writeC <- msg
 							}
@@ -308,7 +315,7 @@ func GuardianOptionWatchers(watcherConfigs []watchers.WatcherConfig, ibcWatcherC
 					common.MustRegisterReadinessSyncing(wc.GetChainID())
 				}
 
-				chainObsvReqC[wc.GetChainID()] = make(chan *gossipv1.ObservationRequest, observationRequestBufferSize)
+				chainObsvReqC[wc.GetChainID()] = make(chan *gossipv1.ObservationRequest, observationRequestPerChainBufferSize)
 
 				if wc.RequiredL1Finalizer() != "" {
 					l1watcher, ok := watchers[wc.RequiredL1Finalizer()]
@@ -344,7 +351,7 @@ func GuardianOptionWatchers(watcherConfigs []watchers.WatcherConfig, ibcWatcherC
 						continue
 					}
 
-					chainObsvReqC[chainID] = make(chan *gossipv1.ObservationRequest, observationRequestBufferSize)
+					chainObsvReqC[chainID] = make(chan *gossipv1.ObservationRequest, observationRequestPerChainBufferSize)
 					common.MustRegisterReadinessSyncing(chainID)
 
 					chainConfig = append(chainConfig, ibc.ChainConfigEntry{
@@ -379,7 +386,7 @@ func GuardianOptionAdminService(socketPath string, ethRpc *string, ethContract *
 			adminService, err := adminServiceRunnable(
 				logger,
 				socketPath,
-				g.injectC.writeC,
+				g.msgC.writeC,
 				g.signedInC.writeC,
 				g.obsvReqSendC.writeC,
 				g.db,
@@ -445,15 +452,6 @@ func GuardianOptionPublicWeb(listenAddr string, publicGRPCSocketPath string, tls
 		}}
 }
 
-func GuardianOptionBigTablePersistence(config *reporter.BigTableConnectionConfig) *GuardianOption {
-	return &GuardianOption{
-		name: "bigtable",
-		f: func(ctx context.Context, logger *zap.Logger, g *G) error {
-			g.runnables["bigtable"] = reporter.BigTableWriter(g.attestationEvents, config)
-			return nil
-		}}
-}
-
 // GuardianOptionDatabase configures the main database to be used for this guardian node.
 // Dependencies: none
 func GuardianOptionDatabase(db *db.Database) *GuardianOption {
@@ -482,11 +480,9 @@ func GuardianOptionProcessor() *GuardianOption {
 				g.gossipSendC,
 				g.obsvC,
 				g.obsvReqSendC.writeC,
-				g.injectC.readC,
 				g.signedInC.readC,
 				g.gk,
 				g.gst,
-				g.attestationEvents,
 				g.gov,
 				g.acct,
 				g.acctC.readC,

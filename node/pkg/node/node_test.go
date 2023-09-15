@@ -22,6 +22,7 @@ import (
 
 	"sync/atomic"
 
+	"github.com/certusone/wormhole/node/pkg/adminrpc"
 	"github.com/certusone/wormhole/node/pkg/common"
 	"github.com/certusone/wormhole/node/pkg/db"
 	"github.com/certusone/wormhole/node/pkg/devnet"
@@ -63,6 +64,8 @@ const WAIT_FOR_METRICS = false
 
 // The level at which logs will be written to console; During testing, logs are produced and buffered at Info level, because some tests need to look for certain entries.
 var CONSOLE_LOG_LEVEL = zap.InfoLevel
+
+const guardianSetIndex = 5 // index of the active guardian set (can be anything, just needs to be set to something)
 
 var TEST_ID_CTR atomic.Uint32
 
@@ -341,9 +344,12 @@ func waitForVaa(t testing.TB, ctx context.Context, c publicrpcv1.PublicRPCServic
 }
 
 type testCase struct {
-	msg *common.MessagePublication // a Wormhole message
+	msg    *common.MessagePublication // a Wormhole message
+	govMsg *nodev1.GovernanceMessage  // protobuf representation of msg as governance message, if applicable.
 	// number of Guardians who will initially observe this message through the mock watcher
 	numGuardiansObserve int
+	// number of Guardians where the governance message will be injected through the adminrpc
+	numGuardiansInjectGov int
 	// if true, Guardians will not observe this message in the mock watcher, if they receive a reobservation request for it
 	unavailableInReobservation bool
 	// if true, the test environment will inject a reobservation request signed by Guardian 1,
@@ -509,6 +515,34 @@ func TestMain(m *testing.M) {
 	os.Exit(m.Run())
 }
 
+func createGovernanceMsgAndVaa(t testing.TB) (*common.MessagePublication, *nodev1.GovernanceMessage) {
+	t.Helper()
+	msgGov := someMessage()
+	msgGov.EmitterAddress = vaa.GovernanceEmitter
+	msgGov.EmitterChain = vaa.GovernanceChain
+
+	govMsg := &nodev1.GovernanceMessage{
+		Sequence: msgGov.Sequence,
+		Nonce:    msgGov.Nonce,
+		Payload: &nodev1.GovernanceMessage_GuardianSet{
+			GuardianSet: &nodev1.GuardianSetUpdate{
+				Guardians: []*nodev1.GuardianSetUpdate_Guardian{
+					{
+						Pubkey: "0x187727CdD17C8142FE9b29A066F577548423aF0e",
+						Name:   "P2P Validator",
+					},
+				},
+			},
+		},
+	}
+	govVaa, err := adminrpc.GovMsgToVaa(govMsg, guardianSetIndex, msgGov.Timestamp)
+	require.NoError(t, err)
+	msgGov.Payload = govVaa.Payload
+	msgGov.ConsistencyLevel = govVaa.ConsistencyLevel
+
+	return msgGov, govMsg
+}
+
 // TestConsensus tests that a set of guardians can form consensus on certain messages and reject certain other messages
 func TestConsensus(t *testing.T) {
 	// adjust processor time intervals to make tests pass faster
@@ -522,6 +556,8 @@ func TestConsensus(t *testing.T) {
 
 	msgGovEmitter := someMessage()
 	msgGovEmitter.EmitterAddress = vaa.GovernanceEmitter
+
+	msgGov, msgGovProto := createGovernanceMsgAndVaa(t)
 
 	msgWrongEmitterChain := someMessage()
 	msgWrongEmitterChain.EmitterChain = vaa.ChainIDEthereum
@@ -585,6 +621,13 @@ func TestConsensus(t *testing.T) {
 			numGuardiansObserve: numGuardians,
 			mustReachQuorum:     true,
 		},
+		{ // Injected governance message
+			msg:                   msgGov,
+			govMsg:                msgGovProto,
+			numGuardiansObserve:   0,
+			numGuardiansInjectGov: numGuardians,
+			mustReachQuorum:       true,
+		},
 		// TODO add a testcase to test the automatic re-observation requests.
 		// Need to refactor various usage of wall time to a mockable time first. E.g. using https://github.com/benbjohnson/clock
 	}
@@ -594,7 +637,6 @@ func TestConsensus(t *testing.T) {
 // runConsensusTests spins up `numGuardians` guardians and runs & verifies the testCases
 func runConsensusTests(t *testing.T, testCases []testCase, numGuardians int) {
 	const testTimeout = time.Second * 30
-	const guardianSetIndex = 5           // index of the active guardian set (can be anything, just needs to be set to something)
 	const vaaCheckGuardianIndex uint = 0 // we will query this guardian's publicrpc for VAAs
 	const adminRpcGuardianIndex uint = 0 // we will query this guardian's adminRpc
 	testId := getTestId()
@@ -681,31 +723,45 @@ func runConsensusTests(t *testing.T, testCases []testCase, numGuardians int) {
 			}
 		}
 
-		// Wait for adminrpc to come online
-		for zapObserver.FilterMessage("admin server listening on").FilterField(zap.String("path", gs[adminRpcGuardianIndex].config.adminSocket)).Len() == 0 {
-			logger.Info("admin server seems to be offline (according to logs). Waiting 100ms...")
-			time.Sleep(time.Microsecond * 100)
-		}
-
-		// Send manual re-observation requests
+		// Do adminrpc stuff: Send manual re-observation requests and perform governance msg injections
 		func() { // put this in own function to use defer
-			s := fmt.Sprintf("unix:///%s", gs[adminRpcGuardianIndex].config.adminSocket)
-			conn, err := grpc.DialContext(ctx, s, grpc.WithTransportCredentials(insecure.NewCredentials()))
-			require.NoError(t, err)
-			defer conn.Close()
+			// Wait for adminrpc to come online
+			adminCs := make([]nodev1.NodePrivilegedServiceClient, numGuardians)
+			for i := 0; i < numGuardians; i++ {
+				for zapObserver.FilterMessage("admin server listening on").FilterField(zap.String("path", gs[i].config.adminSocket)).Len() == 0 {
+					logger.Info("admin server seems to be offline (according to logs). Waiting 100ms...")
+					time.Sleep(time.Microsecond * 100)
+				}
 
-			c := nodev1.NewNodePrivilegedServiceClient(conn)
+				s := fmt.Sprintf("unix:///%s", gs[i].config.adminSocket)
+				conn, err := grpc.DialContext(ctx, s, grpc.WithTransportCredentials(insecure.NewCredentials()))
+				require.NoError(t, err)
+				defer conn.Close()
+				adminCs[i] = nodev1.NewNodePrivilegedServiceClient(conn)
+			}
 
 			for i, testCase := range testCases {
 				if testCase.performManualReobservationRequest {
-					// timeout for grpc query
 					logger.Info("injecting observation request through admin rpc", zap.Int("test_case", i))
 					queryCtx, queryCancel := context.WithTimeout(ctx, time.Second)
-					_, err = c.SendObservationRequest(queryCtx, &nodev1.SendObservationRequestRequest{
+					_, err := adminCs[adminRpcGuardianIndex].SendObservationRequest(queryCtx, &nodev1.SendObservationRequestRequest{
 						ObservationRequest: &gossipv1.ObservationRequest{
 							ChainId: uint32(testCase.msg.EmitterChain),
 							TxHash:  testCase.msg.TxHash[:],
 						},
+					})
+					queryCancel()
+					assert.NoError(t, err)
+				}
+
+				for j := 0; j < testCase.numGuardiansInjectGov; j++ {
+					require.NotNil(t, testCase.govMsg)
+					logger.Info("injecting message through admin rpc", zap.Int("test_case", i), zap.Int("guardian", j))
+					queryCtx, queryCancel := context.WithTimeout(ctx, time.Second)
+					_, err := adminCs[j].InjectGovernanceVAA(queryCtx, &nodev1.InjectGovernanceVAARequest{
+						CurrentSetIndex: guardianSetIndex,
+						Messages:        []*nodev1.GovernanceMessage{testCase.govMsg},
+						Timestamp:       uint32(testCase.msg.Timestamp.Unix()),
 					})
 					queryCancel()
 					assert.NoError(t, err)
@@ -857,10 +913,10 @@ func TestGuardianConfigs(t *testing.T) {
 		{
 			name: "double-configuration",
 			opts: []*GuardianOption{
-				GuardianOptionBigTablePersistence(nil),
-				GuardianOptionBigTablePersistence(nil),
+				GuardianOptionDatabase(nil),
+				GuardianOptionDatabase(nil),
 			},
-			err: "Component bigtable is already configured and cannot be configured a second time",
+			err: "Component db is already configured and cannot be configured a second time",
 		},
 	}
 	runGuardianConfigTests(t, tc)
@@ -1005,6 +1061,44 @@ func BenchmarkCrypto(b *testing.B) {
 		})
 	})
 
+	/*
+		RSA is an option for libp2p.
+		In an optimized RSA implementation, signature verification in RSA can be faster than with elliptic curves, while signature generation is always slower.
+		Since libp2p is verification-heavy, this might overall still be a faster option.
+		This benchmarks show that the libp2p RSA sigverify seems to be unoptimized and is actually slower than ED25519, as of go-libp2p v0.29.2:
+			libp2p_(Ed25519)/sign-64		36178 ns/op
+			libp2p_(Ed25519)/verify-64		85326 ns/op
+			libp2p_(RSA)/sign-64		  2226550 ns/op
+			libp2p_(RSA)/verify-64		   327945 ns/op
+	*/
+	b.Run("libp2p (RSA)", func(b *testing.B) {
+
+		r := math_rand.New(math_rand.NewSource(0)) //#nosec G404 testnet / devnet keys are public knowledge
+		p2pKey, _, err := libp2p_crypto.GenerateKeyPairWithReader(libp2p_crypto.RSA, 2048, r)
+		if err != nil {
+			panic(err)
+		}
+
+		b.Run("sign", func(b *testing.B) {
+			msgs := signingMsgs(b.N)
+			b.ResetTimer()
+			signMsgsP2p(p2pKey, msgs)
+		})
+
+		b.Run("verify", func(b *testing.B) {
+			msgs := signingMsgs(b.N)
+			signatures := signMsgsP2p(p2pKey, msgs)
+			b.ResetTimer()
+
+			// RSA.Verify
+			for i := 0; i < b.N; i++ {
+				ok, err := p2pKey.GetPublic().Verify(msgs[i], signatures[i])
+				assert.NoError(b, err)
+				assert.True(b, ok)
+			}
+		})
+	})
+
 	b.Run("ethcrypto (secp256k1)", func(b *testing.B) {
 
 		gk := devnet.InsecureDeterministicEcdsaKeyByIndex(ethcrypto.S256(), 0)
@@ -1037,12 +1131,14 @@ func BenchmarkConsensus(b *testing.B) {
 	//CONSOLE_LOG_LEVEL = zap.DebugLevel
 	//CONSOLE_LOG_LEVEL = zap.InfoLevel
 	CONSOLE_LOG_LEVEL = zap.WarnLevel
-	runConsensusBenchmark(b, "1", 19, 1000, 10) // ~10s
+	runConsensusBenchmark(b, "1", 19, 1000, 50) // ~7.5s
 	//runConsensusBenchmark(b, "1", 19, 1000, 5) // ~10s
 	//runConsensusBenchmark(b, "1", 19, 1000, 1) // ~13s
 }
 
 func runConsensusBenchmark(t *testing.B, name string, numGuardians int, numMessages int, maxPendingObs int) {
+	const vaaCheckGuardianIndex = 1 // we will query this Guardian for VAAs.
+
 	t.Run(name, func(t *testing.B) {
 		require.Equal(t, t.N, 1)
 		testId := getTestId()
@@ -1105,12 +1201,12 @@ func runConsensusBenchmark(t *testing.B, name string, numGuardians int, numMessa
 			logger.Info("All Guardians have received at least one heartbeat.")
 
 			// Wait for publicrpc to come online.
-			for zapObserver.FilterMessage("publicrpc server listening").FilterField(zap.String("addr", gs[0].config.publicRpc)).Len() == 0 {
+			for zapObserver.FilterMessage("publicrpc server listening").FilterField(zap.String("addr", gs[vaaCheckGuardianIndex].config.publicRpc)).Len() == 0 {
 				logger.Info("publicrpc seems to be offline (according to logs). Waiting 100ms...")
 				time.Sleep(time.Microsecond * 100)
 			}
 			// now that it's online, connect to publicrpc of guardian-0
-			conn, err := grpc.DialContext(ctx, gs[0].config.publicRpc, grpc.WithTransportCredentials(insecure.NewCredentials()))
+			conn, err := grpc.DialContext(ctx, gs[vaaCheckGuardianIndex].config.publicRpc, grpc.WithTransportCredentials(insecure.NewCredentials()))
 			require.NoError(t, err)
 			defer conn.Close()
 			c := publicrpcv1.NewPublicRPCServiceClient(conn)

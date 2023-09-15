@@ -5,6 +5,7 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"time"
 
 	"github.com/cosmos/cosmos-sdk/baseapp"
 	"github.com/cosmos/cosmos-sdk/client"
@@ -15,6 +16,7 @@ import (
 	"github.com/cosmos/cosmos-sdk/server/api"
 	"github.com/cosmos/cosmos-sdk/server/config"
 	servertypes "github.com/cosmos/cosmos-sdk/server/types"
+	store "github.com/cosmos/cosmos-sdk/store/types"
 	sdk "github.com/cosmos/cosmos-sdk/types"
 	"github.com/cosmos/cosmos-sdk/types/module"
 	"github.com/cosmos/cosmos-sdk/version"
@@ -84,6 +86,7 @@ import (
 	tmjson "github.com/tendermint/tendermint/libs/json"
 	"github.com/tendermint/tendermint/libs/log"
 	tmos "github.com/tendermint/tendermint/libs/os"
+	tmproto "github.com/tendermint/tendermint/proto/tendermint/types"
 	dbm "github.com/tendermint/tm-db"
 
 	"github.com/CosmWasm/wasmd/x/wasm"
@@ -113,6 +116,10 @@ import (
 	packetforward "github.com/strangelove-ventures/packet-forward-middleware/v4/router"
 	packetforwardkeeper "github.com/strangelove-ventures/packet-forward-middleware/v4/router/keeper"
 	packetforwardtypes "github.com/strangelove-ventures/packet-forward-middleware/v4/router/types"
+
+	ibccomposabilitymw "github.com/wormhole-foundation/wormchain/x/ibc-composability-mw"
+	ibccomposabilitymwkeeper "github.com/wormhole-foundation/wormchain/x/ibc-composability-mw/keeper"
+	ibccomposabilitytypes "github.com/wormhole-foundation/wormchain/x/ibc-composability-mw/types"
 )
 
 const (
@@ -191,6 +198,7 @@ var (
 		tokenfactory.AppModuleBasic{},
 		ibchooks.AppModuleBasic{},
 		packetforward.AppModuleBasic{},
+		ibccomposabilitymw.AppModuleBasic{},
 	)
 
 	// module account permissions
@@ -209,6 +217,8 @@ var (
 	}
 
 	tokenFactoryCapabilities = []string{}
+
+	Upgrades = []Upgrade{V2_23_0_Upgrade}
 )
 
 var (
@@ -269,10 +279,11 @@ type App struct {
 	// IBC modules
 	RawIcs20TransferAppModule transfer.AppModule
 	IBCHooksKeeper            *ibchookskeeper.Keeper
-	TransferStack             *ibchooks.IBCMiddleware
+	TransferStack             *ibccomposabilitymw.IBCMiddleware
 	Ics20WasmHooks            *ibchooks.WasmHooks
 	HooksICS4Wrapper          ibchooks.ICS4Middleware
 	PacketForwardKeeper       *packetforwardkeeper.Keeper
+	IbcComposabilityMwKeeper  *ibccomposabilitymwkeeper.Keeper
 
 	// this line is used by starport scaffolding # stargate/app/keeperDeclaration
 	wasmKeeper       wasm.Keeper
@@ -281,6 +292,9 @@ type App struct {
 
 	// the module manager
 	mm *module.Manager
+
+	// module configurator
+	configurator module.Configurator
 }
 
 // New returns a reference to an initialized Gaia.
@@ -310,7 +324,7 @@ func New(
 		minttypes.StoreKey, distrtypes.StoreKey, slashingtypes.StoreKey,
 		govtypes.StoreKey, paramstypes.StoreKey, ibchost.StoreKey, upgradetypes.StoreKey, feegrant.StoreKey,
 		evidencetypes.StoreKey, ibctransfertypes.StoreKey, capabilitytypes.StoreKey,
-		wormholemoduletypes.StoreKey,
+		wormholemoduletypes.StoreKey, ibccomposabilitytypes.StoreKey,
 		// this line is used by starport scaffolding # stargate/app/storeKey
 		wasm.StoreKey, tokenfactorytypes.StoreKey,
 		ibchookstypes.StoreKey, packetforwardtypes.StoreKey,
@@ -380,6 +394,7 @@ func New(
 
 	app.FeeGrantKeeper = feegrantkeeper.NewKeeper(appCodec, keys[feegrant.StoreKey], app.AccountKeeper)
 	app.UpgradeKeeper = upgradekeeper.NewKeeper(skipUpgradeHeights, keys[upgradetypes.StoreKey], appCodec, homePath, app.BaseApp)
+	app.WormholeKeeper.SetUpgradeKeeper(app.UpgradeKeeper)
 
 	// register the staking hooks
 	// NOTE: stakingKeeper above is passed by reference, so that it will contain these hooks
@@ -394,7 +409,7 @@ func New(
 		appCodec, keys[ibchost.StoreKey], app.GetSubspace(ibchost.ModuleName), app.StakingKeeper, app.UpgradeKeeper, app.ScopedIBCKeeper,
 	)
 
-	app.WireICS20PreWasmKeeper()
+	app.WireICS20PreWasmKeeper(&app.WormholeKeeper)
 
 	// register the proposal types
 	govRouter := govtypes.NewRouter()
@@ -464,6 +479,7 @@ func New(
 
 	app.ContractKeeper = wasmkeeper.NewDefaultPermissionKeeper(app.wasmKeeper)
 	app.Ics20WasmHooks.ContractKeeper = app.ContractKeeper
+	app.IbcComposabilityMwKeeper.SetWasmKeeper(&app.wasmKeeper)
 
 	// Create static IBC router, add transfer route, then set and seal it
 	ibcRouter := ibcporttypes.NewRouter()
@@ -471,6 +487,9 @@ func New(
 		AddRoute(wasm.ModuleName, wasm.NewIBCHandler(app.wasmKeeper, app.IBCKeeper.ChannelKeeper, app.IBCKeeper.ChannelKeeper))
 	// this line is used by starport scaffolding # ibc/app/router
 	app.IBCKeeper.SetRouter(ibcRouter)
+
+	//upgrade handlers
+	app.configurator = module.NewConfigurator(app.appCodec, app.MsgServiceRouter(), app.GRPCQueryRouter())
 
 	/****  Module Options ****/
 
@@ -508,6 +527,7 @@ func New(
 		tokenfactory.NewAppModule(app.TokenFactoryKeeper, app.AccountKeeper, app.BankKeeper),
 		ibchooks.NewAppModule(app.AccountKeeper),
 		packetforward.NewAppModule(app.PacketForwardKeeper),
+		ibccomposabilitymw.NewAppModule(app.IbcComposabilityMwKeeper),
 	)
 
 	// During begin block slashing happens after distr.BeginBlocker so that
@@ -538,6 +558,7 @@ func New(
 		tokenfactorytypes.ModuleName,
 		ibchookstypes.ModuleName,
 		packetforwardtypes.ModuleName,
+		ibccomposabilitytypes.ModuleName,
 	)
 
 	app.mm.SetOrderEndBlockers(
@@ -564,6 +585,7 @@ func New(
 		tokenfactorytypes.ModuleName,
 		ibchookstypes.ModuleName,
 		packetforwardtypes.ModuleName,
+		ibccomposabilitytypes.ModuleName,
 	)
 
 	// NOTE: The genutils module must occur after staking so that pools are
@@ -598,16 +620,20 @@ func New(
 		tokenfactorytypes.ModuleName,
 		ibchookstypes.ModuleName,
 		packetforwardtypes.ModuleName,
+		ibccomposabilitytypes.ModuleName,
 	)
 
 	app.mm.RegisterInvariants(&app.CrisisKeeper)
 	app.mm.RegisterRoutes(app.Router(), app.QueryRouter(), encodingConfig.Amino)
-	app.mm.RegisterServices(module.NewConfigurator(app.appCodec, app.MsgServiceRouter(), app.GRPCQueryRouter()))
+	app.mm.RegisterServices(app.configurator)
 
 	// initialize stores
 	app.MountKVStores(keys)
 	app.MountTransientStores(tkeys)
 	app.MountMemoryStores(memKeys)
+
+	// register upgrade
+	app.setupUpgradeHandlers(app.configurator)
 
 	// initialize BaseApp
 	app.SetInitChainer(app.InitChainer)
@@ -629,6 +655,8 @@ func New(
 
 	app.SetAnteHandler(wrappedAnteHandler)
 	app.SetEndBlocker(app.EndBlocker)
+
+	app.setupUpgradeStoreLoaders()
 
 	if loadLatest {
 		if err := app.LoadLatestVersion(); err != nil {
@@ -817,15 +845,31 @@ func initParamsKeeper(appCodec codec.BinaryCodec, legacyAmino *codec.LegacyAmino
 // WireICS20PreWasmKeeper Create the IBC Transfer Stack from bottom to top:
 //
 // * SendPacket. Originates from the transferKeeper and goes up the stack:
-// transferKeeper.SendPacket -> ibc_hooks.SendPacket -> channel.SendPacket
+// transferKeeper.SendPacket -> ibc_hooks.SendPacket -> ibcComposabilityMw.SendPacket -> channel.SendPacket
 // * RecvPacket, message that originates from core IBC and goes down to app, the flow is the other way
-// channel.RecvPacket -> wormholeMW.OnRecvPackate -> ibc_hooks.OnRecvPacket -> forward.OnRecvPacket -> transfer.OnRecvPacket
+// channel.RecvPacket -> ibcComposabilityMw.OnRecvPackate -> ibc_hooks.OnRecvPacket -> forward.OnRecvPacket -> transfer.OnRecvPacket
 //
-// Note that the forward middleware and wormholeMW is only integrated on the "receive" direction.
+// Note that the forward middleware is only integrated on the "receive" direction.
 // It can be safely skipped when sending.
 //
 // After this, the wasm keeper is required to be set on app.Ics20WasmHooks
-func (app *App) WireICS20PreWasmKeeper() {
+func (app *App) WireICS20PreWasmKeeper(wk *wormholemodulekeeper.Keeper) {
+	// Configure the ibc composability mw keeper
+	ibcComposabilityMwKeeper := ibccomposabilitymwkeeper.NewKeeper(
+		app.appCodec,
+		app.keys[ibccomposabilitytypes.StoreKey],
+		nil, // Wasm keeper is set later
+		wk,
+		0,
+		time.Hour,
+	)
+	app.IbcComposabilityMwKeeper = ibcComposabilityMwKeeper
+
+	ibcComposabilityMwICS4Wrapper := ibccomposabilitymw.NewICS4Middleware(
+		app.IBCKeeper.ChannelKeeper,
+		ibcComposabilityMwKeeper,
+	)
+
 	// Configure the hooks keeper
 	ibcHooksKeeper := ibchookskeeper.NewKeeper(
 		app.keys[ibchookstypes.StoreKey],
@@ -837,7 +881,7 @@ func (app *App) WireICS20PreWasmKeeper() {
 	wasmHooks := ibchooks.NewWasmHooks(&ibcHooksKeeper, nil, wormPrefix) // The contract keeper needs to be set later
 	app.Ics20WasmHooks = &wasmHooks
 	app.HooksICS4Wrapper = ibchooks.NewICS4Middleware(
-		app.IBCKeeper.ChannelKeeper,
+		ibcComposabilityMwICS4Wrapper,
 		app.Ics20WasmHooks,
 	)
 
@@ -872,7 +916,7 @@ func (app *App) WireICS20PreWasmKeeper() {
 	)
 
 	// Set up transfer stack
-	// channel.RecvPacket -> wormholeMW.OnRecvPacket -> ibc_hooks.OnRecvPacket -> forward.OnRecvPacket -> transfer.OnRecvPacket
+	// channel.RecvPacket -> ibcComposabilityMw.OnRecvPacket -> ibc_hooks.OnRecvPacket -> forward.OnRecvPacket -> transfer.OnRecvPacket
 	packetForwardMiddleware := packetforward.NewIBCMiddleware(
 		transfer.NewIBCModule(app.TransferKeeper),
 		app.PacketForwardKeeper,
@@ -883,5 +927,68 @@ func (app *App) WireICS20PreWasmKeeper() {
 
 	// Hooks Middleware
 	hooksTransferModule := ibchooks.NewIBCMiddleware(packetForwardMiddleware, &app.HooksICS4Wrapper)
-	app.TransferStack = &hooksTransferModule
+
+	// IBC Composability Middleware
+	ibcComposabilityMiddleware := ibccomposabilitymw.NewIBCMiddleware(&hooksTransferModule, &ibcComposabilityMwICS4Wrapper, ibcComposabilityMwKeeper)
+	app.TransferStack = &ibcComposabilityMiddleware
+}
+
+// configure store loader that checks if version == upgradeHeight and applies store upgrades
+func (app *App) setupUpgradeStoreLoaders() {
+	upgradeInfo, err := app.UpgradeKeeper.ReadUpgradeInfoFromDisk()
+	if err != nil {
+		panic("failed to read upgrade info from disk" + err.Error())
+	}
+
+	if app.UpgradeKeeper.IsSkipHeight(upgradeInfo.Height) {
+		return
+	}
+
+	for _, upgrade := range Upgrades {
+		if upgradeInfo.Name == upgrade.UpgradeName {
+			storeUpgrades := upgrade.StoreUpgrades
+			app.SetStoreLoader(
+				upgradetypes.UpgradeStoreLoader(upgradeInfo.Height, &storeUpgrades),
+			)
+		}
+	}
+}
+
+func (app *App) setupUpgradeHandlers(cfg module.Configurator) {
+	for _, upgrade := range Upgrades {
+		app.UpgradeKeeper.SetUpgradeHandler(
+			upgrade.UpgradeName,
+			upgrade.CreateUpgradeHandler(
+				app.mm,
+				cfg,
+				app,
+			),
+		)
+	}
+}
+
+// BaseAppParamManager defines an interrace that BaseApp is expected to fullfil
+// that allows upgrade handlers to modify BaseApp parameters.
+type BaseAppParamManager interface {
+	GetConsensusParams(ctx sdk.Context) *tmproto.ConsensusParams
+	StoreConsensusParams(ctx sdk.Context, cp *tmproto.ConsensusParams)
+}
+
+// Upgrade defines a struct containing necessary fields that a SoftwareUpgradeProposal
+// must have written, in order for the state migration to go smoothly.
+// An upgrade must implement this struct, and then set it in the app.go.
+// The app.go will then define the handler.
+type Upgrade struct {
+	// Upgrade version name, for the upgrade handler, e.g. `v7`
+	UpgradeName string
+
+	// CreateUpgradeHandler defines the function that creates an upgrade handler
+	CreateUpgradeHandler func(
+		*module.Manager,
+		module.Configurator,
+		*App,
+	) upgradetypes.UpgradeHandler
+
+	// Store upgrades, should be used for any new modules introduced, new modules deleted, or store names renamed.
+	StoreUpgrades store.StoreUpgrades
 }

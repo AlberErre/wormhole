@@ -39,9 +39,7 @@ import (
 	"github.com/certusone/wormhole/node/pkg/devnet"
 	"github.com/certusone/wormhole/node/pkg/node"
 	"github.com/certusone/wormhole/node/pkg/p2p"
-	"github.com/certusone/wormhole/node/pkg/reporter"
 	"github.com/certusone/wormhole/node/pkg/supervisor"
-	cosmoscrypto "github.com/cosmos/cosmos-sdk/crypto/types"
 	libp2p_crypto "github.com/libp2p/go-libp2p/core/crypto"
 	"github.com/libp2p/go-libp2p/core/peer"
 	"github.com/spf13/cobra"
@@ -126,6 +124,10 @@ var (
 	xplaLCD      *string
 	xplaContract *string
 
+	gatewayWS       *string
+	gatewayLCD      *string
+	gatewayContract *string
+
 	algorandIndexerRPC   *string
 	algorandIndexerToken *string
 	algorandAlgodRPC     *string
@@ -143,9 +145,11 @@ var (
 	ibcLCD      *string
 	ibcContract *string
 
-	accountantContract     *string
-	accountantWS           *string
-	accountantCheckEnabled *bool
+	accountantContract      *string
+	accountantWS            *string
+	accountantCheckEnabled  *bool
+	accountantKeyPath       *string
+	accountantKeyPassPhrase *string
 
 	aptosRPC     *string
 	aptosAccount *string
@@ -198,13 +202,6 @@ var (
 
 	// Loki cloud logging parameters
 	telemetryLokiURL *string
-
-	bigTablePersistenceEnabled *bool
-	bigTableGCPProject         *string
-	bigTableInstanceName       *string
-	bigTableTableName          *string
-	bigTableTopicName          *string
-	bigTableKeyPath            *string
 
 	chainGovernorEnabled *bool
 
@@ -287,6 +284,10 @@ func init() {
 	xplaLCD = NodeCmd.Flags().String("xplaLCD", "", "Path to LCD service root for XPLA http calls")
 	xplaContract = NodeCmd.Flags().String("xplaContract", "", "Wormhole contract address on XPLA blockchain")
 
+	gatewayWS = NodeCmd.Flags().String("gatewayWS", "", "Path to root for Gateway watcher websocket connection")
+	gatewayLCD = NodeCmd.Flags().String("gatewayLCD", "", "Path to LCD service root for Gateway watcher http calls")
+	gatewayContract = NodeCmd.Flags().String("gatewayContract", "", "Wormhole contract address on Gateway blockchain")
+
 	algorandIndexerRPC = NodeCmd.Flags().String("algorandIndexerRPC", "", "Algorand Indexer RPC URL")
 	algorandIndexerToken = NodeCmd.Flags().String("algorandIndexerToken", "", "Algorand Indexer access token")
 	algorandAlgodRPC = NodeCmd.Flags().String("algorandAlgodRPC", "", "Algorand Algod RPC URL")
@@ -297,6 +298,8 @@ func init() {
 	nearContract = NodeCmd.Flags().String("nearContract", "", "near contract")
 
 	wormchainURL = NodeCmd.Flags().String("wormchainURL", "", "wormhole-chain gRPC URL")
+
+	// TODO: These are deprecated. Get rid of them once the guardians have had a chance to migrate off of them.
 	wormchainKeyPath = NodeCmd.Flags().String("wormchainKeyPath", "", "path to wormhole-chain private key for signing transactions")
 	wormchainKeyPassPhrase = NodeCmd.Flags().String("wormchainKeyPassPhrase", "", "pass phrase used to unarmor the wormchain key file")
 
@@ -306,6 +309,8 @@ func init() {
 
 	accountantWS = NodeCmd.Flags().String("accountantWS", "", "Websocket used to listen to the accountant smart contract on wormchain")
 	accountantContract = NodeCmd.Flags().String("accountantContract", "", "Address of the accountant smart contract on wormchain")
+	accountantKeyPath = NodeCmd.Flags().String("accountantKeyPath", "", "path to accountant private key for signing transactions")
+	accountantKeyPassPhrase = NodeCmd.Flags().String("accountantKeyPassPhrase", "", "pass phrase used to unarmor the accountant key file")
 	accountantCheckEnabled = NodeCmd.Flags().Bool("accountantCheckEnabled", false, "Should accountant be enforced on transfers")
 
 	aptosRPC = NodeCmd.Flags().String("aptosRPC", "", "aptos RPC URL")
@@ -362,13 +367,6 @@ func init() {
 		"Google Cloud Project to use for Telemetry logging")
 
 	telemetryLokiURL = NodeCmd.Flags().String("telemetryLokiURL", "", "Loki cloud logging URL")
-
-	bigTablePersistenceEnabled = NodeCmd.Flags().Bool("bigTablePersistenceEnabled", false, "Turn on forwarding events to BigTable")
-	bigTableGCPProject = NodeCmd.Flags().String("bigTableGCPProject", "", "Google Cloud project ID for storing events")
-	bigTableInstanceName = NodeCmd.Flags().String("bigTableInstanceName", "", "BigTable instance name for storing events")
-	bigTableTableName = NodeCmd.Flags().String("bigTableTableName", "", "BigTable table name to store events in")
-	bigTableTopicName = NodeCmd.Flags().String("bigTableTopicName", "", "GCP topic name to publish to")
-	bigTableKeyPath = NodeCmd.Flags().String("bigTableKeyPath", "", "Path to json Service Account key")
 
 	chainGovernorEnabled = NodeCmd.Flags().Bool("chainGovernorEnabled", false, "Run the chain governor")
 
@@ -623,6 +621,14 @@ func runNode(cmd *cobra.Command, args []string) {
 		logger.Fatal("Both --baseContract and --baseRPC must be set together or both unset")
 	}
 
+	if *gatewayWS != "" {
+		if *gatewayLCD == "" || *gatewayContract == "" {
+			logger.Fatal("If --gatewayWS is specified, then --gatewayLCD and --gatewayContract must be specified")
+		}
+	} else if *gatewayLCD != "" || *gatewayContract != "" {
+		logger.Fatal("If --gatewayWS is not specified, then --gatewayLCD and --gatewayContract must not be specified")
+	}
+
 	if *testnetMode {
 		if *neonRPC == "" {
 			logger.Fatal("Please specify --neonRPC")
@@ -716,6 +722,9 @@ func runNode(cmd *cobra.Command, args []string) {
 		if *pythnetRPC == "" {
 			logger.Fatal("Please specify --pythnetRPC")
 		}
+		if *pythnetWS == "" {
+			logger.Fatal("Please specify --pythnetWS")
+		}
 
 		if *injectiveWS == "" {
 			logger.Fatal("Please specify --injectiveWS")
@@ -725,24 +734,6 @@ func runNode(cmd *cobra.Command, args []string) {
 		}
 		if *injectiveContract == "" {
 			logger.Fatal("Please specify --injectiveContract")
-		}
-	}
-
-	if *bigTablePersistenceEnabled {
-		if *bigTableGCPProject == "" {
-			logger.Fatal("Please specify --bigTableGCPProject")
-		}
-		if *bigTableInstanceName == "" {
-			logger.Fatal("Please specify --bigTableInstanceName")
-		}
-		if *bigTableTableName == "" {
-			logger.Fatal("Please specify --bigTableTableName")
-		}
-		if *bigTableTopicName == "" {
-			logger.Fatal("Please specify --bigTableTopicName")
-		}
-		if *bigTableKeyPath == "" {
-			logger.Fatal("Please specify --bigTableKeyPath")
 		}
 	}
 
@@ -881,6 +872,8 @@ func runNode(cmd *cobra.Command, args []string) {
 	rpcMap["terraLCD"] = *terraLCD
 	rpcMap["terra2WS"] = *terra2WS
 	rpcMap["terra2LCD"] = *terra2LCD
+	rpcMap["gatewayWS"] = *gatewayWS
+	rpcMap["gatewayLCD"] = *gatewayLCD
 	rpcMap["xplaWS"] = *xplaWS
 	rpcMap["xplaLCD"] = *xplaLCD
 
@@ -975,39 +968,56 @@ func runNode(cmd *cobra.Command, args []string) {
 	// Redirect ipfs logs to plain zap
 	ipfslog.SetPrimaryCore(logger.Core())
 
-	// If the wormchain sending info is configured, connect to it.
-	var wormchainKey cosmoscrypto.PrivKey
-	var wormchainConn *wormconn.ClientConn
-	if *wormchainURL != "" {
-		if *wormchainKeyPath == "" {
-			logger.Fatal("if wormchainURL is specified, wormchainKeyPath is required")
+	wormchainId := "wormchain"
+	if *testnetMode {
+		wormchainId = "wormchain-testnet-0"
+	}
+
+	var accountantWormchainConn *wormconn.ClientConn
+	if *accountantContract != "" {
+		// TODO: wormchainKeyPath and wormchainKeyPassPhrase are being replaced by accountantKeyPath and accountantKeyPassPhrase.
+		//       Give the guardians time to migrate off of the old parameters, but then remove them.
+		keyPath := *accountantKeyPath
+		if keyPath == "" {
+			if *wormchainKeyPath == "" {
+				logger.Fatal("if accountantContract is specified, accountantKeyPath is required", zap.String("component", "gacct"))
+			}
+			logger.Error("the wormchainKeyPath parameter is deprecated, please change to accountantKeyPath", zap.String("component", "gacct"))
+			keyPath = *wormchainKeyPath
+		} else if *wormchainKeyPath != "" {
+			logger.Fatal("the wormchainKeyPath parameter is obsolete, please remove it", zap.String("component", "gacct"))
 		}
 
-		if *wormchainKeyPassPhrase == "" {
-			logger.Fatal("if wormchainURL is specified, wormchainKeyPassPhrase is required")
+		keyPassPhrase := *accountantKeyPassPhrase
+		if keyPassPhrase == "" {
+			if *wormchainKeyPassPhrase == "" {
+				logger.Fatal("if accountantContract is specified, accountantKeyPassPhrase is required", zap.String("component", "gacct"))
+			}
+			logger.Error("the wormchainKeyPassPhrase parameter is deprecated, please change to accountantKeyPassPhrase", zap.String("component", "gacct"))
+			keyPassPhrase = *wormchainKeyPassPhrase
+		} else if *wormchainKeyPassPhrase != "" {
+			logger.Fatal("the wormchainKeyPassPhrase parameter is obsolete, please remove it", zap.String("component", "gacct"))
 		}
 
-		// Load the wormchain key.
-		wormchainKeyPathName := *wormchainKeyPath
+		keyPathName := keyPath
 		if *unsafeDevMode {
 			idx, err := devnet.GetDevnetIndex()
 			if err != nil {
-				logger.Fatal("failed to get devnet index", zap.Error(err))
+				logger.Fatal("failed to get devnet index", zap.Error(err), zap.String("component", "gacct"))
 			}
-			wormchainKeyPathName = fmt.Sprint(*wormchainKeyPath, idx)
+			keyPathName = fmt.Sprint(keyPath, idx)
 		}
 
-		logger.Debug("loading key file", zap.String("key path", wormchainKeyPathName))
-		wormchainKey, err = wormconn.LoadWormchainPrivKey(wormchainKeyPathName, *wormchainKeyPassPhrase)
+		wormchainKey, err := wormconn.LoadWormchainPrivKey(keyPathName, keyPassPhrase)
 		if err != nil {
-			logger.Fatal("failed to load wormchain private key", zap.Error(err))
+			logger.Fatal("failed to load wormchain private key", zap.Error(err), zap.String("component", "gacct"))
 		}
 
 		// Connect to wormchain.
-		logger.Info("Connecting to wormchain", zap.String("wormchainURL", *wormchainURL), zap.String("wormchainKeyPath", wormchainKeyPathName))
-		wormchainConn, err = wormconn.NewConn(rootCtx, *wormchainURL, wormchainKey)
+		logger.Info("Connecting to wormchain", zap.String("wormchainURL", *wormchainURL), zap.String("keyPath", keyPathName), zap.String("component", "gacct"))
+		accountantWormchainConn, err = wormconn.NewConn(rootCtx, *wormchainURL, wormchainKey, wormchainId)
 		if err != nil {
-			logger.Fatal("failed to connect to wormchain", zap.Error(err))
+			logger.Fatal("failed to connect to wormchain", zap.Error(err), zap.String("component", "gacct"))
 		}
 	}
 
@@ -1033,13 +1043,13 @@ func runNode(cmd *cobra.Command, args []string) {
 			wormchainKeyPathName = fmt.Sprint(*gatewayRelayerKeyPath, idx)
 		}
 
-		wormchainKey, err = wormconn.LoadWormchainPrivKey(wormchainKeyPathName, *gatewayRelayerKeyPassPhrase)
+		wormchainKey, err := wormconn.LoadWormchainPrivKey(wormchainKeyPathName, *gatewayRelayerKeyPassPhrase)
 		if err != nil {
 			logger.Fatal("failed to load private key", zap.Error(err), zap.String("component", "gwrelayer"))
 		}
 
-		logger.Info("Connecting to wormchain", zap.String("wormchainURL", *wormchainURL), zap.String("gatewayRelayerKeyPath", wormchainKeyPathName), zap.String("component", "gwrelayer"))
-		gatewayRelayerWormchainConn, err = wormconn.NewConn(rootCtx, *wormchainURL, wormchainKey)
+		logger.Info("Connecting to wormchain", zap.String("wormchainURL", *wormchainURL), zap.String("keyPath", wormchainKeyPathName), zap.String("component", "gwrelayer"))
+		gatewayRelayerWormchainConn, err = wormconn.NewConn(rootCtx, *wormchainURL, wormchainKey, wormchainId)
 		if err != nil {
 			logger.Fatal("failed to connect to wormchain", zap.Error(err), zap.String("component", "gwrelayer"))
 		}
@@ -1357,6 +1367,18 @@ func runNode(cmd *cobra.Command, args []string) {
 		watcherConfigs = append(watcherConfigs, wc)
 	}
 
+	if shouldStart(gatewayWS) {
+		wc := &cosmwasm.WatcherConfig{
+			NetworkID: "gateway",
+			ChainID:   vaa.ChainIDWormchain,
+			Websocket: *gatewayWS,
+			Lcd:       *gatewayLCD,
+			Contract:  *gatewayContract,
+		}
+
+		watcherConfigs = append(watcherConfigs, wc)
+	}
+
 	if *testnetMode {
 		if shouldStart(neonRPC) {
 			if !shouldStart(solanaRPC) {
@@ -1402,7 +1424,7 @@ func runNode(cmd *cobra.Command, args []string) {
 	guardianOptions := []*node.GuardianOption{
 		node.GuardianOptionDatabase(db),
 		node.GuardianOptionWatchers(watcherConfigs, ibcWatcherConfig),
-		node.GuardianOptionAccountant(*accountantContract, *accountantWS, *accountantCheckEnabled, wormchainConn),
+		node.GuardianOptionAccountant(*accountantContract, *accountantWS, *accountantCheckEnabled, accountantWormchainConn),
 		node.GuardianOptionGovernor(*chainGovernorEnabled),
 		node.GuardianOptionGatewayRelayer(*gatewayRelayerContract, gatewayRelayerWormchainConn),
 		node.GuardianOptionAdminService(*adminSocketPath, ethRPC, ethContract, rpcMap),
@@ -1423,18 +1445,6 @@ func runNode(cmd *cobra.Command, args []string) {
 				node.GuardianOptionPublicWeb(*publicWeb, *publicGRPCSocketPath, *tlsHostname, *tlsProdEnv, path.Join(*dataDir, "autocert")),
 			)
 		}
-	}
-
-	if *bigTablePersistenceEnabled {
-		bigTableConnectionConfig := &reporter.BigTableConnectionConfig{
-			GcpProjectID:    *bigTableGCPProject,
-			GcpInstanceName: *bigTableInstanceName,
-			TableName:       *bigTableTableName,
-			TopicName:       *bigTableTopicName,
-			GcpKeyFilePath:  *bigTableKeyPath,
-		}
-
-		guardianOptions = append(guardianOptions, node.GuardianOptionBigTablePersistence(bigTableConnectionConfig))
 	}
 
 	// Run supervisor with Guardian Node as root.
